@@ -1,77 +1,101 @@
+// api/webhooks-stripe.js
 import Stripe from "stripe";
-import axios from "axios";
+import { buffer } from "micro";
 
-const stripe = new Stripe(process.env.STIRPE_SECRET_KEY || process.env.STRIPE_SECRET_KEY);
-const SHOP_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
-const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
-const CURRENCY = process.env.CURRENCY || "usd";
+// 让我们能拿到原始请求体做签名校验
+export const config = { api: { bodyParser: false } };
 
-export const config = {
-  api: { bodyParser: false },
-};
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || process.env.STIRPE_SECRET_KEY);
 
-function readRawBody(req) {
-  return new Promise((resolve) => {
-    let data = Buffer.from("");
-    req.on("data", (chunk) => (data = Buffer.concat([data, chunk])));
-    req.on("end", () => resolve(data));
+async function createShopifyOrderFromSession(session) {
+  // 取完整的 line_items，并把我们在 create-checkout-session 里塞进 product_data.metadata 的 variantId 取出来
+  const full = await stripe.checkout.sessions.retrieve(session.id, {
+    expand: ["line_items.data.price.product"],
   });
-}
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).end();
-
-  const raw = await readRawBody(req);
-  const sig = req.headers["stripe-signature"];
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(raw, sig, process.env.WEBHOOK_SECRET);
-  } catch (e) {
-    console.error("Invalid signature", e.message);
-    return res.status(400).send("Bad signature");
-  }
-
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object;
-
-    try {
-      const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100 });
-      const orderLineItems = li.data.map((x) => ({
-        title: x.description,
-        quantity: x.quantity,
-        price: (x.amount_subtotal / x.quantity / 100).toFixed(2),
-      }));
-
-      const payload = {
-        order: {
-          email: session.customer_details?.email,
-          financial_status: "paid",
-          currency: (session.currency || CURRENCY).toUpperCase(),
-          total_price: (session.amount_total / 100).toFixed(2),
-          shipping_address: {
-            first_name: session.customer_details?.name?.split(" ")?.[0] || "",
-            last_name: session.customer_details?.name?.split(" ")?.slice(1).join(" ") || "",
-            address1: session.customer_details?.address?.line1 || "",
-            address2: session.customer_details?.address?.line2 || "",
-            city: session.customer_details?.address?.city || "",
-            country: session.customer_details?.address?.country || "",
-            zip: session.customer_details?.address?.postal_code || "",
-            phone: session.customer_details?.phone || "",
-          },
-          line_items: orderLineItems,
-          note: `Stripe session: ${session.id} | PM: ${session.payment_method_types?.join(",")}`,
-        },
-      };
-
-      const url = `https://${SHOP_DOMAIN}/admin/api/2024-10/orders.json`;
-      await axios.post(url, payload, {
-        headers: { "X-Shopify-Access-Token": ADMIN_TOKEN },
-      });
-
-    } catch (e) {
-      console.error("Create order failed", e?.response?.data || e.message);
+  const items = [];
+  for (const li of full?.line_items?.data || []) {
+    const variantId = li?.price?.product?.metadata?.variantId;
+    const qty = li?.quantity || 1;
+    if (variantId) {
+      items.push({ variant_id: Number(variantId), quantity: qty });
     }
   }
 
-  res.status(200).end();
+  // 构造收货信息（有些订单可能没有 shipping_details，要容错）
+  const sd = session.shipping_details || {};
+  const addr = sd.address || {};
+  const [first=''] = (sd.name || '').split(' ');
+  const last = (sd.name || '').split(' ').slice(1).join(' ');
+
+  // 通过 Shopify Admin API 创建“已支付订单”
+  const orderPayload = {
+    order: {
+      email: session.customer_details?.email || "",
+      financial_status: "paid",
+      currency: session.currency?.toUpperCase() || "USD",
+      line_items: items,
+      shipping_address: {
+        first_name: first,
+        last_name: last,
+        address1: addr.line1 || addr.line_1 || "",
+        address2: addr.line2 || addr.line_2 || "",
+        city: addr.city || "",
+        province: addr.state || addr.province || "",
+        country: addr.country || "",
+        zip: addr.postal_code || addr.zip || "",
+        phone: session.customer_details?.phone || ""
+      },
+      note: `Stripe session: ${session.id}`,
+    }
+  };
+
+  const resp = await fetch(
+    `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-07/orders.json`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+      },
+      body: JSON.stringify(orderPayload),
+    }
+  );
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    console.error("Shopify order create failed:", resp.status, text);
+    throw new Error(`Shopify order create failed: ${resp.status}`);
+  }
+
+  const data = await resp.json();
+  console.log("Shopify order created:", data?.order?.id);
+  return data?.order;
+}
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
+
+  const sig = req.headers["stripe-signature"];
+  let event;
+
+  try {
+    const buf = await buffer(req);
+    event = stripe.webhooks.constructEvent(buf, sig, process.env.WEBHOOK_SECRET);
+  } catch (err) {
+    console.error("Webhook signature verification failed:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object; // Stripe Checkout Session
+      await createShopifyOrderFromSession(session);
+    }
+    // 其它事件先忽略
+    res.status(200).json({ received: true });
+  } catch (e) {
+    console.error("Webhook handler error:", e?.message || e);
+    res.status(500).json({ error: "webhook handler failed" });
+  }
 }
