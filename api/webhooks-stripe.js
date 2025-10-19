@@ -1,14 +1,21 @@
 // api/webhooks-stripe.js
 import Stripe from "stripe";
-import { buffer } from "micro";
 
-// 让我们能拿到原始请求体做签名校验
+// Vercel/Node: 读取原始请求体，供 Stripe 验签
+async function getRawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
 export const config = { api: { bodyParser: false } };
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || process.env.STIRPE_SECRET_KEY);
 
 async function createShopifyOrderFromSession(session) {
-  // 取完整的 line_items，并把我们在 create-checkout-session 里塞进 product_data.metadata 的 variantId 取出来
+  // 拉取完整 line_items，并取我们写入的 variantId
   const full = await stripe.checkout.sessions.retrieve(session.id, {
     expand: ["line_items.data.price.product"],
   });
@@ -17,23 +24,19 @@ async function createShopifyOrderFromSession(session) {
   for (const li of full?.line_items?.data || []) {
     const variantId = li?.price?.product?.metadata?.variantId;
     const qty = li?.quantity || 1;
-    if (variantId) {
-      items.push({ variant_id: Number(variantId), quantity: qty });
-    }
+    if (variantId) items.push({ variant_id: Number(variantId), quantity: qty });
   }
 
-  // 构造收货信息（有些订单可能没有 shipping_details，要容错）
   const sd = session.shipping_details || {};
   const addr = sd.address || {};
-  const [first=''] = (sd.name || '').split(' ');
-  const last = (sd.name || '').split(' ').slice(1).join(' ');
+  const [first = ""] = (sd.name || "").split(" ");
+  const last = (sd.name || "").split(" ").slice(1).join(" ");
 
-  // 通过 Shopify Admin API 创建“已支付订单”
-  const orderPayload = {
+  const payload = {
     order: {
       email: session.customer_details?.email || "",
       financial_status: "paid",
-      currency: session.currency?.toUpperCase() || "USD",
+      currency: (session.currency || "usd").toUpperCase(),
       line_items: items,
       shipping_address: {
         first_name: first,
@@ -44,10 +47,10 @@ async function createShopifyOrderFromSession(session) {
         province: addr.state || addr.province || "",
         country: addr.country || "",
         zip: addr.postal_code || addr.zip || "",
-        phone: session.customer_details?.phone || ""
+        phone: session.customer_details?.phone || "",
       },
       note: `Stripe session: ${session.id}`,
-    }
+    },
   };
 
   const resp = await fetch(
@@ -58,7 +61,7 @@ async function createShopifyOrderFromSession(session) {
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
       },
-      body: JSON.stringify(orderPayload),
+      body: JSON.stringify(payload),
     }
   );
 
@@ -76,12 +79,12 @@ async function createShopifyOrderFromSession(session) {
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
 
-  const sig = req.headers["stripe-signature"];
+  const signature = req.headers["stripe-signature"];
   let event;
 
   try {
-    const buf = await buffer(req);
-    event = stripe.webhooks.constructEvent(buf, sig, process.env.WEBHOOK_SECRET);
+    const raw = await getRawBody(req);
+    event = stripe.webhooks.constructEvent(raw, signature, process.env.WEBHOOK_SECRET);
   } catch (err) {
     console.error("Webhook signature verification failed:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
@@ -89,13 +92,12 @@ export default async function handler(req, res) {
 
   try {
     if (event.type === "checkout.session.completed") {
-      const session = event.data.object; // Stripe Checkout Session
+      const session = event.data.object;
       await createShopifyOrderFromSession(session);
     }
-    // 其它事件先忽略
-    res.status(200).json({ received: true });
+    return res.status(200).json({ received: true });
   } catch (e) {
     console.error("Webhook handler error:", e?.message || e);
-    res.status(500).json({ error: "webhook handler failed" });
+    return res.status(500).json({ error: "webhook handler failed" });
   }
 }
