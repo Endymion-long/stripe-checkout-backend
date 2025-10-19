@@ -2,35 +2,52 @@
 import Stripe from "stripe";
 import { getVariant, lookupShopifyDiscount } from "./_lib/shopify.js";
 
-// 兼容写法：优先 STRIPE_SECRET_KEY
+// ---------- Config from ENV ----------
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || process.env.STIRPE_SECRET_KEY);
-const CURRENCY = process.env.CURRENCY || "usd";
+const CURRENCY = (process.env.CURRENCY || "usd").toLowerCase();
 
-/**
- * 允许跨域的来源（逗号分隔）:
- * 例：ALLOWED_ORIGINS="https://evemois.com,https://www.evemois.com,https://evemois.myshopify.com"
- * 调试也可先用 * ，但上线务必改成你的域名
- */
+// 回跳地址（务必为 https 绝对地址；success_url 必须包含 {CHECKOUT_SESSION_ID}）
+const SUCCESS_URL =
+  process.env.SUCCESS_URL ||
+  "https://evermois.com/pages/stripe-success?session_id={CHECKOUT_SESSION_ID}";
+const CANCEL_URL = process.env.CANCEL_URL || "https://evermois.com/cart";
+
+// 允许的前端来源（多个域名用逗号）
+// 例：ALLOWED_ORIGINS="https://evermois.com,https://www.evermois.com,https://evermois.myshopify.com"
 const ORIGINS = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || "*")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
 
+// 运费（可选）：在 Stripe Dashboard 建好 Shipping rate，拿到 shr_xxx 放到 DEFAULT_SHIPPING_RATE_ID
+const DEFAULT_SHIPPING_RATE_ID = process.env.DEFAULT_SHIPPING_RATE_ID || "";
+
+// 可运国家（ISO 两位代码，逗号分隔），没配就用一个常用集合
+const SHIPPING_COUNTRIES = (process.env.SHIPPING_COUNTRIES ||
+  "US,CA,GB,AU,DE,FR,IT,ES,NL,SE,DK,IE,AT,BE")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// 结账页语言/地址收集策略（可按需改）
+const LOCALE = process.env.CHECKOUT_LOCALE || "auto";        // 'auto' | 'en' | 'de' | ...
+const BILLING_COLLECTION = process.env.BILLING_COLLECTION || "auto"; // 'auto' or 'required'
+
+// ---------- Helpers ----------
 function pickOrigin(req) {
   const origin = req.headers.origin || "";
   if (ORIGINS.includes("*")) return "*";
   return ORIGINS.includes(origin) ? origin : ORIGINS[0] || "*";
 }
 
-/** 将 Shopify 的简单折扣（百分比 / 固定减 + 最低门槛）映射为 Stripe Promotion Code */
+// 仅支持“百分比 / 固定减 + 最低金额”的基础折扣；复杂规则需后端自算
 async function ensureStripePromotionForShopifyCode(code, priceRule) {
   const { value_type, value, prerequisite_subtotal_range } = priceRule;
 
-  // 已存在就复用
+  // 已存在则直接用
   const existing = await stripe.promotionCodes.list({ code, limit: 1 });
   if (existing.data?.[0]) return existing.data[0].id;
 
-  // 仅支持两类基础优惠：百分比 或 固定金额（一次性）
   let coupon;
   if (value_type === "percentage") {
     coupon = await stripe.coupons.create({
@@ -44,10 +61,9 @@ async function ensureStripePromotionForShopifyCode(code, priceRule) {
       duration: "once",
     });
   } else {
-    return null; // 复杂规则不映射（需要后端自算）
+    return null; // 其它复杂规则：不映射
   }
 
-  // 最低订单金额（可选）
   const restrictions = {};
   if (prerequisite_subtotal_range?.greater_than_or_equal_to) {
     restrictions.minimum_amount = Math.round(
@@ -64,10 +80,11 @@ async function ensureStripePromotionForShopifyCode(code, priceRule) {
   return promo.id;
 }
 
+// ---------- Route Handler ----------
 export default async function handler(req, res) {
   const allowOrigin = pickOrigin(req);
 
-  // 处理 CORS 预检
+  // CORS 预检
   if (req.method === "OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", allowOrigin);
     res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -75,7 +92,7 @@ export default async function handler(req, res) {
     return res.status(204).end();
   }
 
-  // 正式响应也加 CORS
+  // CORS for actual response
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
 
   if (req.method !== "POST") {
@@ -83,12 +100,12 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { items = [], promo } = req.body; // items: [{variantId, quantity}]
+    const { items = [], promo } = req.body; // items: [{ variantId, quantity }]
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "No items" });
     }
 
-    // 1) 以 Shopify 价格为准构建 line_items
+    // 1) 按 Shopify 变体实价构建 line_items
     const line_items = [];
     for (const it of items) {
       if (!it?.variantId || !it?.quantity) continue;
@@ -101,7 +118,6 @@ export default async function handler(req, res) {
           unit_amount: unitAmount,
           product_data: {
             name: v.title,
-            // 把变体信息放 metadata，便于后续 webhook 精确回写/扣库存
             metadata: {
               variantId: String(it.variantId),
               shopify_product_id: String(v.product_id),
@@ -114,7 +130,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Invalid items" });
     }
 
-    // 2) 处理折扣：把可映射的 Shopify 折扣转成 Stripe Promotion Code
+    // 2) 折扣映射（可选）
     let discounts;
     if (promo) {
       const found = await lookupShopifyDiscount(promo);
@@ -122,28 +138,36 @@ export default async function handler(req, res) {
         const promoId = await ensureStripePromotionForShopifyCode(promo, found.priceRule);
         if (promoId) discounts = [{ promotion_code: promoId }];
       }
-      // 查不到或不支持的规则：忽略（也可返回提示由你决定）
     }
 
     // 3) 创建 Stripe Checkout Session
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      payment_method_types: ["card", "afterpay_clearpay", "klarna", "link"], // Apple Pay/Google Pay 属于 card wallet，会自动显示
+      // Apple Pay / Google Pay 属于 card 的 wallet，会自动显示
+      payment_method_types: ["card", "afterpay_clearpay", "klarna", "link"],
       line_items,
+
+      // 体验/合规
+      locale: LOCALE,
+      billing_address_collection: BILLING_COLLECTION,
       automatic_tax: { enabled: true },
-      shipping_address_collection: { allowed_countries: ["US", "CA", "GB", "AU", "DE"] },
-      shipping_options: process.env.DEFAULT_SHIPPING_RATE_ID
-        ? [{ shipping_rate: process.env.DEFAULT_SHIPPING_RATE_ID }]
-        : undefined,
-      discounts, // 可能为空
-      // ↓ 把你的成功/取消页换成你的域名
-      success_url: "https://yourdomain.com/checkout/success?session_id={CHECKOUT_SESSION_ID}",
-      cancel_url: "https://yourdomain.com/checkout/cancel",
+
+      // 运送/地址
+      shipping_address_collection: { allowed_countries: SHIPPING_COUNTRIES },
+      shipping_options: DEFAULT_SHIPPING_RATE_ID ? [{ shipping_rate: DEFAULT_SHIPPING_RATE_ID }] : undefined,
+
+      // 折扣（可能为空）
+      discounts,
+
+      // 回跳
+      success_url: SUCCESS_URL,
+      cancel_url: CANCEL_URL,
     });
 
+    // 返回跳转链接
     return res.status(200).json({ url: session.url });
   } catch (e) {
-    console.error("create session error", e?.response?.data || e.message);
+    console.error("create-checkout-session error:", e?.raw || e?.message || e);
     return res.status(500).json({ error: "create session failed" });
   }
 }
