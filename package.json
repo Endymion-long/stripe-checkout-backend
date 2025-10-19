@@ -1,0 +1,9 @@
+{
+  "name": "stripe-checkout-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "axios": "^1.7.7",
+    "stripe": "^16.0.0"
+  }
+}
