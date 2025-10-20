@@ -30,7 +30,7 @@ const SHIPPING_COUNTRIES = (process.env.SHIPPING_COUNTRIES ||
   .filter(Boolean);
 
 // 结账页语言/地址收集策略（可按需改）
-const LOCALE = process.env.CHECKOUT_LOCALE || "auto";        // 'auto' | 'en' | 'de' | ...
+const LOCALE = process.env.CHECKOUT_LOCALE || "en";        // 'auto' | 'en' | 'de' | ...
 const BILLING_COLLECTION = process.env.BILLING_COLLECTION || "auto"; // 'auto' or 'required'
 
 // ---------- Helpers ----------
