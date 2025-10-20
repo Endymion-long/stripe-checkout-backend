@@ -144,7 +144,7 @@ export default async function handler(req, res) {
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       // Apple Pay / Google Pay 属于 card 的 wallet，会自动显示
-      payment_method_types: ["card", "afterpay_clearpay", "klarna", "link"],
+      payment_method_types: ["card", "afterpay_clearpay", "link"],
       line_items,
 
       // 体验/合规
