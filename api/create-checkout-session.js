@@ -148,7 +148,7 @@ export default async function handler(req, res) {
       line_items,
 
       // 体验/合规
-      locale: “en”,
+      locale: LOCALE,
       billing_address_collection: BILLING_COLLECTION,
       automatic_tax: { enabled: true },
 
