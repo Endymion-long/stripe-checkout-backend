@@ -72,7 +72,7 @@ export default async function handler(req, res) {
     // 创建 Session（✅只允许用户在页面输入优惠码）
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      payment_method_types: ["card", "afterpay_clearpay", "klarna", "link"], // Apple Pay/Google Pay 属于 card wallet
+      payment_method_types: ["card", "afterpay_clearpay", "link"], // Apple Pay/Google Pay 属于 card wallet
       line_items,
 
       // 体验/合规
