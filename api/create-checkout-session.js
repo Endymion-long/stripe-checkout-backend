@@ -11,6 +11,7 @@ const SUCCESS_URL =
   process.env.SUCCESS_URL ||
   "https://evermois.com/pages/stripe-success?session_id={CHECKOUT_SESSION_ID}";
 const CANCEL_URL = process.env.CANCEL_URL || "https://evermois.com/cart";
+const DEFAULT_PROMO_CODE = process.env.DEFAULT_PROMO_CODE || "";
 
 // 允许的前端来源（多个域名用逗号）
 // 例：ALLOWED_ORIGINS="https://evermois.com,https://www.evermois.com,https://evermois.myshopify.com"
@@ -132,13 +133,15 @@ export default async function handler(req, res) {
 
     // 2) 折扣映射（可选）
     let discounts;
-    if (promo) {
-      const found = await lookupShopifyDiscount(promo);
-      if (found?.priceRule) {
-        const promoId = await ensureStripePromotionForShopifyCode(promo, found.priceRule);
-        if (promoId) discounts = [{ promotion_code: promoId }];
-      }
-    }
+const promoToUse = (typeof promo === "string" && promo.trim()) || DEFAULT_PROMO_CODE;
+
+if (promoToUse) {
+  const found = await lookupShopifyDiscount(promoToUse);
+  if (found?.priceRule) {
+    const promoId = await ensureStripePromotionForShopifyCode(promoToUse, found.priceRule);
+    if (promoId) discounts = [{ promotion_code: promoId }];
+  }
+}
 
     // 3) 创建 Stripe Checkout Session
     const session = await stripe.checkout.sessions.create({
@@ -146,7 +149,7 @@ export default async function handler(req, res) {
       // Apple Pay / Google Pay 属于 card 的 wallet，会自动显示
       payment_method_types: ["card", "afterpay_clearpay", "link"],
       line_items,
-
+      allow_promotion_codes:true,
       // 体验/合规
       locale: LOCALE,
       billing_address_collection: BILLING_COLLECTION,
